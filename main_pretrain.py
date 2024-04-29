@@ -18,13 +18,24 @@ from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
+import torch.distributed
+import wandb
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+import math
+import sys
+from typing import Iterable
+
+import torch
+
+import util.misc as misc
+import util.lr_sched as lr_sched
+from matplotlib import pyplot as plt
+import wandb
 
 import timm
 
-assert timm.__version__ == "0.3.2"  # version check
+# assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
@@ -32,11 +43,9 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_mae
 
-from engine_pretrain import train_one_epoch
-
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
+    parser = argparse.ArgumentParser('MAE pre-training', add_help=True, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--batch_size', default=64, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=400, type=int)
@@ -77,8 +86,6 @@ def get_args_parser():
 
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default='./output_dir',
-                        help='path where to tensorboard log')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
@@ -101,14 +108,24 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
 
+    # logging parameters
+    parser.add_argument('--log_image_interval', type=int, help="How often to log images. If None, logs at beginning of epoch", default=None)
+    parser.add_argument('--log_image', action='store_true', dest='log_image', help="Log images to wandb", default=True)
+    parser.add_argument('--no_log_image', action='store_false', dest='log_image')
+
+    #  microus specific
+    parser.add_argument('--probing_nct', action='store_true', default=False)
+    parser.add_argument('--no_probing_nct', action='store_false', dest='probing_nct')
+
+    # fmt:off
     return parser
 
 
 def main(args):
     misc.init_distributed_mode(args)
 
-    print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
-    print("{}".format(args).replace(', ', ',\n'))
+    print("job dir: {}".format(os.path.dirname(os.path.realpath(__file__))))
+    print("{}".format(args).replace(", ", ",\n"))
 
     device = torch.device(args.device)
 
@@ -120,12 +137,19 @@ def main(args):
     cudnn.benchmark = True
 
     # simple augmentation
-    transform_train = transforms.Compose([
-            transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
+    transform_train = transforms.Compose(
+        [
+            transforms.RandomResizedCrop(
+                args.input_size, scale=(0.2, 1.0), interpolation=3
+            ),  # 3 is bicubic
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    dataset_train = datasets.ImageFolder(
+        os.path.join(args.data_path, "train"), transform=transform_train
+    )
     print(dataset_train)
 
     if True:  # args.distributed:
@@ -138,22 +162,22 @@ def main(args):
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
-    if global_rank == 0 and args.log_dir is not None:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
+    if global_rank == 0:
+        log_writer = wandb.init(project="mae-microus", config=args)
     else:
         log_writer = None
 
     data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
+        dataset_train,
+        sampler=sampler_train,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True,
     )
-    
+
     # define the model
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss, img_size=args.input_size)
 
     model.to(device)
 
@@ -161,7 +185,7 @@ def main(args):
     print("Model = %s" % str(model_without_ddp))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-    
+
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
 
@@ -172,16 +196,31 @@ def main(args):
     print("effective batch size: %d" % eff_batch_size)
 
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.gpu], find_unused_parameters=True
+        )
         model_without_ddp = model.module
-    
+
     # following timm: set wd as 0 for bias and norm layers
-    param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    param_groups = optim_factory.param_groups_weight_decay(
+        model_without_ddp, args.weight_decay
+    )
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
 
-    misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+    misc.load_model(
+        args=args,
+        model_without_ddp=model_without_ddp,
+        optimizer=optimizer,
+        loss_scaler=loss_scaler,
+    )
+
+    if args.probing_nct: 
+        from probing_nct import NCTProbing
+        probe = NCTProbing(batch_size=args.batch_size, holdout_center="UVA", size=args.input_size)
+    else: 
+        probe = None
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -189,31 +228,150 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
-            model, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
+            model,
+            data_loader_train,
+            optimizer,
+            device,
+            epoch,
+            loss_scaler,
             log_writer=log_writer,
-            args=args
+            args=args,
         )
+
+        # maybe save model
         if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
             misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
+                args=args,
+                model=model,
+                model_without_ddp=model_without_ddp,
+                optimizer=optimizer,
+                loss_scaler=loss_scaler,
+                epoch=epoch,
+            )
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        'epoch': epoch,}
+        # maybe do probing 
+        if probe is not None:  
+            val_stats = probe.run_probing(model.module, epoch, args.device)
+            if misc.is_main_process(): 
+                wandb.log(val_stats)
+                
+        torch.distributed.barrier()
+
+        log_stats = {
+            **{f"train_{k}": v for k, v in train_stats.items()},
+            "epoch": epoch,
+        }
 
         if args.output_dir and misc.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+            # if log_writer is not None:
+            #     log_writer.flush()
+            with open(
+                os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8"
+            ) as f:
                 f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    print("Training time {}".format(total_time_str))
 
 
-if __name__ == '__main__':
+def train_one_epoch(model: torch.nn.Module,
+                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
+                    device: torch.device, epoch: int, loss_scaler,
+                    log_writer=None,
+                    args=None):
+    model.train(True)
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    print_freq = 20
+
+    accum_iter = args.accum_iter
+
+    optimizer.zero_grad()
+
+    for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+
+        # we use a per iteration (instead of per epoch) lr scheduler
+        if data_iter_step % accum_iter == 0:
+            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+
+        samples = samples.to(device, non_blocking=True)
+
+        with torch.cuda.amp.autocast():
+            loss, pred, mask = model(samples, mask_ratio=args.mask_ratio)
+
+        loss_value = loss.item()
+
+        if not math.isfinite(loss_value):
+            print("Loss is {}, stopping training".format(loss_value))
+            sys.exit(1)
+
+        loss /= accum_iter
+        loss_scaler(loss, optimizer, parameters=model.parameters(),
+                    update_grad=(data_iter_step + 1) % accum_iter == 0)
+        if (data_iter_step + 1) % accum_iter == 0:
+            optimizer.zero_grad()
+
+        torch.cuda.synchronize()
+
+        metric_logger.update(loss=loss_value)
+
+        lr = optimizer.param_groups[0]["lr"]
+        metric_logger.update(lr=lr)
+
+        loss_value_reduce = misc.all_reduce_mean(loss_value)
+        
+        if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
+            """ We use epoch_1000x as the x-axis in tensorboard.
+            This calibrates different curves when batch size changes.
+            """
+            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+            log_writer.log({'train_loss': loss_value_reduce})
+            log_writer.log({'lr': lr})
+
+        if args.log_image and log_writer is not None: 
+            if ((args.log_image_interval is not None and (data_iter_step + 1) % args.log_image_interval == 0) or
+                (args.log_image_interval is None and data_iter_step == 0)):
+
+                if log_writer is not None:
+                    
+                    reconstruction = model.module.unpatchify(pred)
+                    reconstruction = reconstruction.detach().cpu()
+                    reconstruction = reconstruction.permute(0, 2, 3, 1)
+
+                    original_image = samples 
+                    patches_image = model.module.patchify(original_image)
+                    patches_image[mask != 0] = 0
+                    masked_image = model.module.unpatchify(patches_image)
+                    masked_image = masked_image.detach().cpu()
+                    masked_image = masked_image.permute(0, 2, 3, 1)
+
+                    images = []
+                    for plot_idx in range(8):
+                        fig, ax = plt.subplots(1, 2)
+                
+                        ax[0].imshow(reconstruction[plot_idx] * torch.tensor([0.229, 0.224, 0.225]) + torch.tensor([0.485, 0.456, 0.406]))
+                        ax[0].axis('off')
+                        ax[0].set_title('Reconstruction')
+
+                        ax[1].imshow(masked_image[plot_idx] * torch.tensor([0.229, 0.224, 0.225]) + torch.tensor([0.485, 0.456, 0.406]))
+                        ax[1].axis('off')
+                        ax[1].set_title('Masked Image')
+
+                        images.append(wandb.Image(fig))
+
+                    log_writer.log({
+                        'reconstruction': images
+                    })
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
     if args.output_dir:
